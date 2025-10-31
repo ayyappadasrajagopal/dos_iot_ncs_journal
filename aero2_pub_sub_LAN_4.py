@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter  # for 2-decimal axis ticks
 import numpy as np
 
 # =========================
@@ -75,8 +76,8 @@ z_int = np.zeros(2)
 # ---- Setpoints (GUI-controlled; keep radians internally) ----
 THETA_REF_DEG_INIT = 10.0
 PSI_REF_DEG_INIT   = 15.0
-theta_ref_cmd = np.deg2rad(THETA_REF_DEG_INIT)  # target command from GUI (rad)
-psi_ref_cmd   = np.deg2rad(PSI_REF_DEG_INIT)    # target command from GUI (rad)
+theta_ref_cmd = np.deg2rad(THETA_REF_DEG_INIT)  # target from GUI (rad)
+psi_ref_cmd   = np.deg2rad(PSI_REF_DEG_INIT)    # target from GUI (rad)
 
 # The *applied* references ramp toward the command at a limited rate:
 theta_d = theta_ref_cmd
@@ -197,29 +198,38 @@ smooth_alpha_var  = tk.DoubleVar(value=0.25)   # sensor smoothing alpha (0..1)
 enable_pred_var   = tk.BooleanVar(value=True)  # enable predict-ahead
 enable_aw_var     = tk.BooleanVar(value=True)  # enable anti-windup
 
+# Display strings with 2-decimal formatting for setpoint labels
+theta_ref_str = tk.StringVar(value=f"{THETA_REF_DEG_INIT:.2f}")
+psi_ref_str   = tk.StringVar(value=f"{PSI_REF_DEG_INIT:.2f}")
+
 def update_refs_from_gui(*_):
+    """Update reference commands from GUI (deg->rad) and refresh 2-decimal labels."""
     global theta_ref_cmd, psi_ref_cmd
-    theta_ref_cmd = np.deg2rad(theta_ref_deg_var.get())
-    psi_ref_cmd   = np.deg2rad(psi_ref_deg_var.get())
+    th_deg = theta_ref_deg_var.get()
+    ps_deg = psi_ref_deg_var.get()
+    theta_ref_cmd = np.deg2rad(th_deg)
+    psi_ref_cmd   = np.deg2rad(ps_deg)
+    theta_ref_str.set(f"{th_deg:.2f}")
+    psi_ref_str.set(f"{ps_deg:.2f}")
 
 def reset_integrator():
     global z_int
     z_int = np.zeros(2)
     log_message("[INFO] Integral states reset.")
 
-# Row: Pitch setpoint
+# Row: Pitch setpoint (with 2-dec label)
 row1 = tk.Frame(sp_frame, bg="#101820"); row1.pack(fill="x", padx=8, pady=3)
 tk.Label(row1, text="Pitch θᵣ (deg):", bg="#101820", fg="white", width=16, anchor="w").pack(side="left")
 theta_scale = ttk.Scale(row1, from_=-60.0, to=60.0, variable=theta_ref_deg_var, command=lambda v: update_refs_from_gui())
 theta_scale.pack(side="left", fill="x", expand=True, padx=8)
-tk.Label(row1, textvariable=theta_ref_deg_var, bg="#101820", fg="white", width=8, anchor="e").pack(side="left")
+tk.Label(row1, textvariable=theta_ref_str, bg="#101820", fg="white", width=8, anchor="e").pack(side="left")
 
-# Row: Yaw setpoint
+# Row: Yaw setpoint (with 2-dec label)
 row2 = tk.Frame(sp_frame, bg="#101820"); row2.pack(fill="x", padx=8, pady=3)
 tk.Label(row2, text="Yaw ψᵣ (deg):", bg="#101820", fg="white", width=16, anchor="w").pack(side="left")
 psi_scale = ttk.Scale(row2, from_=-90.0, to=90.0, variable=psi_ref_deg_var, command=lambda v: update_refs_from_gui())
 psi_scale.pack(side="left", fill="x", expand=True, padx=8)
-tk.Label(row2, textvariable=psi_ref_deg_var, bg="#101820", fg="white", width=8, anchor="e").pack(side="left")
+tk.Label(row2, textvariable=psi_ref_str, bg="#101820", fg="white", width=8, anchor="e").pack(side="left")
 
 # Row: Delay & smoothing
 row3 = tk.Frame(sp_frame, bg="#101820"); row3.pack(fill="x", padx=8, pady=3)
@@ -239,7 +249,7 @@ ttk.Checkbutton(row4, text="Anti-windup", variable=enable_aw_var).pack(side="lef
 btn_row = tk.Frame(sp_frame, bg="#101820"); btn_row.pack(fill="x", padx=8, pady=(6, 8))
 ttk.Button(btn_row, text="Reset Integrator", command=reset_integrator).pack(side="left")
 
-# initialize once
+# initialize refs once
 update_refs_from_gui()
 
 # ---- Logs (BOTTOM-LEFT)
@@ -284,6 +294,12 @@ for ax in (ax_tx, ax_rx):
     ax.tick_params(colors="white")
     ax.xaxis.label.set_color("white")
     ax.yaxis.label.set_color("white")
+
+# 2-decimal tick formatters
+fmt2 = FuncFormatter(lambda y, _: f"{y:.2f}")
+ax_tx.yaxis.set_major_formatter(fmt2)
+ax_rx.yaxis.set_major_formatter(fmt2)
+
 ax_tx.set_title("Transmitted Control (u0, u1) [V]", color="white")
 ax_rx.set_title("Received Angles (θ, ψ) [deg]", color="white")
 ax_tx.set_ylabel("Value")
@@ -350,7 +366,8 @@ def update_rx_graph(theta_deg, psi_deg):
 # ====== RX THREAD ========
 # =========================
 def receive_and_control():
-    global theta_d, psi_d, theta_filt, psi_filt, theta_dot_est, psi_dot_est, _last_t, _last_theta, _last_psi, u_last, z_int, x
+    global theta_d, psi_d, theta_filt, psi_filt, theta_dot_est, psi_dot_est
+    global _last_t, _last_theta, _last_psi, u_last, z_int
 
     while True:
         try:
@@ -381,13 +398,13 @@ def receive_and_control():
         if _last_theta is None:
             _last_theta, _last_psi = theta_filt, psi_filt
         if theta_dot_in is None:
-            theta_dot_est = 0.8 * theta_dot_est + 0.2 * ( (theta_filt - _last_theta) / dt_meas )
+            theta_dot_est = 0.8 * theta_dot_est + 0.2 * ((theta_filt - _last_theta) / dt_meas)
             theta_dot = theta_dot_est
         else:
             theta_dot = theta_dot_in
             theta_dot_est = theta_dot_in
         if psi_dot_in is None:
-            psi_dot_est = 0.8 * psi_dot_est + 0.2 * ( (psi_filt - _last_psi) / dt_meas )
+            psi_dot_est = 0.8 * psi_dot_est + 0.2 * ((psi_filt - _last_psi) / dt_meas)
             psi_dot = psi_dot_est
         else:
             psi_dot = psi_dot_in
@@ -412,12 +429,10 @@ def receive_and_control():
         u_unsat = - K @ (x_for_ctrl - x_ref) - Ki * z_int
         u_sat = np.clip(u_unsat, -U_MAX, U_MAX)
 
-        # Anti-windup: clamp or back-calc
+        # Anti-windup
         if enable_aw_var.get():
-            # back-calculation is smoother than hard clamping
             z_int = anti_windup_update(z_int, err_angles, u_unsat, u_sat, dt_meas, k_aw=1.0)
         else:
-            # simple clamp: integrate only if not saturating further in same direction
             for i in range(2):
                 pushing_deeper = (abs(u_unsat[i]) > U_MAX) and (np.sign(u_unsat[i]) == np.sign(err_angles[i]*Ki[i]))
                 if not pushing_deeper:
@@ -434,11 +449,12 @@ def receive_and_control():
         except Exception as e:
             root.after(0, log_message, f"[SEND ERROR] {e}")
 
-        # GUI updates
+        # GUI updates with 2-dec formatting for angles
         theta_deg = np.rad2deg(theta_filt)
         psi_deg   = np.rad2deg(psi_filt)
         root.after(0, log_message, f"[RECEIVED] {msg}")
-        root.after(0, update_rx_graph, theta_deg, psi_deg)
+        root.after(0, log_message, f"[ANGLES] θ={theta_deg:.2f}°, ψ={psi_deg:.2f}°")
+        root.after(0, update_rx_graph, float(f"{theta_deg:.2f}"), float(f"{psi_deg:.2f}"))
         root.after(0, log_message, f"[SENT CTRL] {out_msg}")
         root.after(0, log_data,   f"{u0:7.3f}, {u1:7.3f}")
         root.after(0, update_tx_graph, u0, u1)
