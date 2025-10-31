@@ -8,7 +8,9 @@ from matplotlib.figure import Figure
 import random
 
 # ========== ZMQ CONFIGURATION ==========
-MY_IP = "10.128.6.217"
+# MY_IP = "10.128.6.217"
+
+MY_IP = "10.128.14.249"
 MY_PORT = 5557
 
 PEER_IP = "10.128.7.67"
