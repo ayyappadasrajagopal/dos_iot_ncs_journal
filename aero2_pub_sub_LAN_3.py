@@ -2,6 +2,7 @@ import zmq
 import threading
 import time
 import tkinter as tk
+from tkinter import ttk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
@@ -43,8 +44,8 @@ B_c = np.array([
     [-0.29, 7.68]
 ])
 
-# Discretization step for control loop (nominal; we’ll integrate with actual dt_meas)
-DT_NOM = 0.01  # 100 Hz control (adjust if your sensor publish rate differs)
+# Nominal discretization step (used for LQR design only)
+DT_NOM = 0.01  # 100 Hz
 A = np.eye(4) + A_c * DT_NOM
 B = B_c * DT_NOM
 
@@ -57,7 +58,6 @@ def dlqr(A, B, Q, R, max_iter=1000, tol=1e-9):
     for _ in range(max_iter):
         BT_P = B.T @ P
         S = R + BT_P @ B
-        K_tmp = np.linalg.inv(S) @ BT_P @ A
         P_next = A.T @ (P - P @ B @ np.linalg.inv(S) @ BT_P) @ A + Q
         if np.max(np.abs(P_next - P)) < tol:
             P = P_next
@@ -72,11 +72,11 @@ K = dlqr(A, B, Q, R)
 Ki = np.array([2.0, 2.0])   # integral gains for [theta, psi]
 z_int = np.zeros(2)
 
-# References (deg) -> will be converted to rad
-THETA_REF_DEG = 10.0
-PSI_REF_DEG   = 15.0
-theta_d = np.deg2rad(THETA_REF_DEG)
-psi_d   = np.deg2rad(PSI_REF_DEG)
+# ---- Setpoints (will be controlled from GUI; keep radians internally) ----
+THETA_REF_DEG_INIT = 10.0
+PSI_REF_DEG_INIT   = 15.0
+theta_d = np.deg2rad(THETA_REF_DEG_INIT)
+psi_d   = np.deg2rad(PSI_REF_DEG_INIT)
 x_ref   = np.array([theta_d, 0.0, psi_d, 0.0])
 
 # Output clip (e.g., motor voltages)
@@ -99,14 +99,13 @@ def parse_sensor_message(msg_str):
       - "theta,psi" (angles only)
       - "theta,theta_dot,psi,psi_dot"
     Auto-detects degrees vs radians (if any |val| > pi => degrees).
-    Returns: theta, theta_dot, psi, psi_dot (all in radians / radians-per-second).
+    Returns: theta, theta_dot, psi, psi_dot (radians / rad/s).
     If derivatives absent, returns None for dot terms (caller estimates).
     """
     parts = [float(x.strip()) for x in msg_str.strip().split(",") if x.strip() != ""]
     if len(parts) not in (2, 4):
         raise ValueError("Expect 2 or 4 comma-separated values.")
 
-    # Unit auto-detection on angle fields
     angle_vals = [parts[0], parts[2]] if len(parts) == 4 else parts[:2]
     in_degrees = any(abs(v) > np.pi for v in angle_vals)
 
@@ -116,13 +115,11 @@ def parse_sensor_message(msg_str):
             theta = np.deg2rad(theta)
             psi   = np.deg2rad(psi)
         return theta, None, psi, None
-
     else:
         theta, theta_dot, psi, psi_dot = parts
         if in_degrees:
             theta     = np.deg2rad(theta)
             psi       = np.deg2rad(psi)
-            # If dots came in deg/s, convert to rad/s as well (assume same units as angles)
             theta_dot = np.deg2rad(theta_dot)
             psi_dot   = np.deg2rad(psi_dot)
         return theta, theta_dot, psi, psi_dot
@@ -130,9 +127,10 @@ def parse_sensor_message(msg_str):
 def control_step_from_sensor(theta, theta_dot_in, psi, psi_dot_in, t_now):
     """
     Build state x (with derivative estimation if needed), update integral,
-    compute control u, clip, and return u, state, and display angles in deg.
+    compute control u, clip, and return u, state angles in deg for GUI.
     """
     global x, z_int, _last_theta, _last_psi, _last_t, theta_dot_est, psi_dot_est
+    global theta_d, psi_d, x_ref  # set by GUI
 
     # Derivative estimation if needed
     if _last_t is None:
@@ -171,7 +169,7 @@ def control_step_from_sensor(theta, theta_dot_in, psi, psi_dot_in, t_now):
     u = - K @ (x - x_ref) - Ki * z_int
     u = np.clip(u, -U_MAX, U_MAX)
 
-    # For GUI display (received angles in deg)
+    # For GUI display
     theta_deg = np.rad2deg(theta)
     psi_deg   = np.rad2deg(psi)
     return u, theta_deg, psi_deg
@@ -181,7 +179,7 @@ def control_step_from_sensor(theta, theta_dot_in, psi, psi_dot_in, t_now):
 # =========================
 root = tk.Tk()
 root.title("IoT Server Platform Dashboard")
-root.geometry("1250x700")
+root.geometry("1350x720")
 root.configure(bg="#101820")
 
 title_label = tk.Label(
@@ -193,27 +191,29 @@ title_label.pack(pady=10)
 main_frame = tk.Frame(root, bg="#101820")
 main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-# Left log panel
-log_frame = tk.Frame(main_frame, bg="#101820")
-log_frame.pack(side="left", fill="y", padx=10)
+# Left column (logs + setpoints)
+left_col = tk.Frame(main_frame, bg="#101820")
+left_col.pack(side="left", fill="y", padx=10)
 
+# ---- Message log
 tk.Label(
-    log_frame, text="Message Log:", font=("Helvetica", 14, "bold"),
+    left_col, text="Message Log:", font=("Helvetica", 14, "bold"),
     bg="#101820", fg="white"
 ).pack(anchor="w")
 
 msg_display = tk.Text(
-    log_frame, height=18, width=45, bg="#1B2735", fg="white", font=("Consolas", 11)
+    left_col, height=16, width=50, bg="#1B2735", fg="white", font=("Consolas", 11)
 )
 msg_display.pack(pady=5)
 
+# ---- Transmitted data log
 tk.Label(
-    log_frame, text="Transmitted Data Log:",
+    left_col, text="Transmitted Data Log:",
     font=("Helvetica", 14, "bold"), bg="#101820", fg="white"
-).pack(anchor="w", pady=(20, 0))
+).pack(anchor="w", pady=(14, 0))
 
 data_display = tk.Text(
-    log_frame, height=15, width=45, bg="#1B2735", fg="#00FF7F", font=("Consolas", 11)
+    left_col, height=10, width=50, bg="#1B2735", fg="#00FF7F", font=("Consolas", 11)
 )
 data_display.pack(pady=5)
 
@@ -225,7 +225,54 @@ def log_data(text):
     data_display.insert(tk.END, text + "\n")
     data_display.see(tk.END)
 
-# Right plots (Transmitted vs Received)
+# ---- Setpoints panel (NEW)
+sp_frame = tk.Frame(left_col, bg="#101820", highlightthickness=1, highlightbackground="#2A3A4D")
+sp_frame.pack(fill="x", pady=(14, 0))
+
+tk.Label(
+    sp_frame, text="Setpoints (Degrees)", font=("Helvetica", 14, "bold"),
+    bg="#101820", fg="#00ADEF"
+).pack(anchor="w", padx=6, pady=(6, 2))
+
+# Variables bound to sliders (deg)
+theta_ref_deg_var = tk.DoubleVar(value=THETA_REF_DEG_INIT)
+psi_ref_deg_var   = tk.DoubleVar(value=PSI_REF_DEG_INIT)
+
+def update_setpoints_from_gui(*_):
+    """Convert GUI degrees -> radians and update global references."""
+    global theta_d, psi_d, x_ref
+    th_deg = theta_ref_deg_var.get()
+    ps_deg = psi_ref_deg_var.get()
+    theta_d = np.deg2rad(th_deg)
+    psi_d   = np.deg2rad(ps_deg)
+    x_ref = np.array([theta_d, 0.0, psi_d, 0.0])
+
+def reset_integrator():
+    global z_int
+    z_int = np.zeros(2)
+    log_message("[INFO] Integral states reset.")
+
+row1 = tk.Frame(sp_frame, bg="#101820"); row1.pack(fill="x", padx=8, pady=4)
+tk.Label(row1, text="Pitch θᵣ:", bg="#101820", fg="white", width=12, anchor="w").pack(side="left")
+theta_scale = ttk.Scale(row1, from_=-45.0, to=45.0, variable=theta_ref_deg_var, command=lambda v: update_setpoints_from_gui())
+theta_scale.pack(side="left", fill="x", expand=True, padx=8)
+theta_val_lbl = tk.Label(row1, textvariable=theta_ref_deg_var, bg="#101820", fg="white", width=7, anchor="e")
+theta_val_lbl.pack(side="left")
+
+row2 = tk.Frame(sp_frame, bg="#101820"); row2.pack(fill="x", padx=8, pady=4)
+tk.Label(row2, text="Yaw ψᵣ:", bg="#101820", fg="white", width=12, anchor="w").pack(side="left")
+psi_scale = ttk.Scale(row2, from_=-45.0, to=45.0, variable=psi_ref_deg_var, command=lambda v: update_setpoints_from_gui())
+psi_scale.pack(side="left", fill="x", expand=True, padx=8)
+psi_val_lbl = tk.Label(row2, textvariable=psi_ref_deg_var, bg="#101820", fg="white", width=7, anchor="e")
+psi_val_lbl.pack(side="left")
+
+btn_row = tk.Frame(sp_frame, bg="#101820"); btn_row.pack(fill="x", padx=8, pady=(6, 8))
+ttk.Button(btn_row, text="Reset Integrator", command=reset_integrator).pack(side="left")
+
+# initialize refs once in case ttk.Scale didn't trigger callback at startup
+update_setpoints_from_gui()
+
+# ---- Right plots (Transmitted vs Received)
 fig = Figure(figsize=(9, 6), dpi=100)
 fig.patch.set_facecolor("#101820")
 ax_tx = fig.add_subplot(211)
@@ -305,7 +352,7 @@ def receive_and_control():
         try:
             msg = sub_socket.recv_string()
         except Exception as e:
-            log_message(f"[RECV ERROR] {e}")
+            root.after(0, log_message, f"[RECV ERROR] {e}")
             continue
 
         t_now = time.monotonic()
@@ -315,7 +362,7 @@ def receive_and_control():
             root.after(0, log_message, f"[RECEIVED] {msg} (parse error: {e})")
             continue
 
-        # Compute control
+        # Compute control with latest GUI setpoints
         u, theta_deg, psi_deg = control_step_from_sensor(theta, theta_dot_in, psi, psi_dot_in, t_now)
         u0, u1 = float(u[0]), float(u[1])
 
