@@ -5,7 +5,7 @@ import tkinter as tk
 from tkinter import ttk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from matplotlib.ticker import FuncFormatter  # for 2-decimal axis ticks
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 
 # =========================
@@ -45,16 +45,16 @@ B_c = np.array([
     [-0.29, 7.68]
 ], dtype=float)
 
-# Nominal discretization step (used for LQR design only)
+# Nominal discretization (for LQR design only)
 DT_NOM = 0.01  # 100 Hz design
 A = np.eye(4) + A_c * DT_NOM
 B = B_c * DT_NOM
 
-# LQR weights (given)
+# LQR weights (slightly higher R to avoid aggression)  # >>> NEW (R up from 0.05)
 Q = np.diag([100, 1, 100, 1]).astype(float)
-R = np.diag([0.05, 0.05]).astype(float)
+R = np.diag([0.10, 0.10]).astype(float)
 
-def dlqr(A, B, Q, R, max_iter=1000, tol=1e-9):
+def dlqr(A, B, Q, R, max_iter=2000, tol=1e-10):
     P = Q.copy()
     for _ in range(max_iter):
         BT_P = B.T @ P
@@ -70,7 +70,7 @@ def dlqr(A, B, Q, R, max_iter=1000, tol=1e-9):
 K = dlqr(A, B, Q, R)
 
 # Integral action (with anti-windup)
-Ki = np.array([2.0, 2.0])   # integral gains for [theta, psi]
+Ki = np.array([0.8, 0.8])   # >>> NEW (reduced from 2.0 to lessen windup under delay)
 z_int = np.zeros(2)
 
 # ---- Setpoints (GUI-controlled; keep radians internally) ----
@@ -93,9 +93,10 @@ def ramp_to(current, target, rate, dt):
     else:
         return max(target, current - step)
 
-# Output clip (e.g., motor voltages)
+# Output clip & slew
 U_MAX = 10.0
-u_last = np.zeros(2)  # for prediction
+DU_MAX = 20.0  # V/s, output slew limit  # >>> NEW
+u_last = np.zeros(2)  # for prediction and slew
 
 # State, with derivative estimation if not provided
 x = np.zeros(4)  # [theta, theta_dot, psi, psi_dot]
@@ -152,9 +153,33 @@ def predict_ahead(x_now, u_now, tau):
 def anti_windup_update(z, err, u_unsat, u_sat, dt, k_aw=1.0):
     """
     Back-calculation anti-windup: z_dot = err + k_aw*(u_sat - u_unsat)
-    Here z is the 2D integral state corresponding to angle errors [theta, psi].
+    z is the 2D integral state for angle errors [theta, psi].
     """
     return z + (err + k_aw * (u_sat - u_unsat)) * dt
+
+def apply_output_slew(u_des, dt):
+    """Limit du/dt to avoid slamming into rails under delay/jitter."""
+    global u_last
+    if dt <= 0:
+        return np.clip(u_des, -U_MAX, U_MAX)
+    du = np.clip(u_des - u_last, -DU_MAX * dt, DU_MAX * dt)
+    u_cmd = u_last + du
+    u_cmd = np.clip(u_cmd, -U_MAX, U_MAX)
+    u_last = u_cmd.copy()
+    return u_cmd
+
+# -------- Feed-forward equilibrium input  (A_c x_des + B_c u_ff = 0)  # >>> NEW
+B_pinv = np.linalg.pinv(B_c)
+def equilibrium_uff(theta_ref_rad, psi_ref_rad):
+    """
+    Compute the steady-state input that holds [theta_ref, 0, psi_ref, 0].
+    u_ff = argmin ||A_c x_des + B_c u|| => u_ff = -pinv(B_c) * (A_c x_des)
+    """
+    x_des = np.array([theta_ref_rad, 0.0, psi_ref_rad, 0.0])
+    u_ff = -B_pinv @ (A_c @ x_des)
+    # keep headroom for feedback by not using full rail
+    u_ff = np.clip(u_ff, -0.9*U_MAX, 0.9*U_MAX)
+    return u_ff, x_des
 
 # =========================
 # ========  GUI  ==========
@@ -162,7 +187,7 @@ def anti_windup_update(z, err, u_unsat, u_sat, dt, k_aw=1.0):
 root = tk.Tk()
 root.title("IoT Server Platform Dashboard")
 root.geometry("1360x760")
-root.minsize(1120, 680)  # ensure setpoint panel doesn't get cropped
+root.minsize(1120, 680)
 root.configure(bg="#101820")
 
 title_label = tk.Label(
@@ -171,16 +196,16 @@ title_label = tk.Label(
 )
 title_label.pack(pady=8)
 
-# Main two-pane layout so the left side is resizable
+# Main two-pane layout
 paned = ttk.Panedwindow(root, orient="horizontal")
 paned.pack(fill="both", expand=True, padx=10, pady=10)
 
 left_col = tk.Frame(paned, bg="#101820")
 right_col = tk.Frame(paned, bg="#101820")
-paned.add(left_col, weight=1)   # give left some weight
-paned.add(right_col, weight=3)  # right gets more space for plots
+paned.add(left_col, weight=1)
+paned.add(right_col, weight=3)
 
-# ---- Setpoints & robustness panel (TOP-LEFT)
+# ---- Control Panel (top-left)
 sp_frame = tk.Frame(left_col, bg="#101820", highlightthickness=1, highlightbackground="#2A3A4D")
 sp_frame.pack(fill="x", padx=6, pady=(0,8))
 
@@ -192,18 +217,18 @@ tk.Label(
 # Variables bound to widgets
 theta_ref_deg_var = tk.DoubleVar(value=THETA_REF_DEG_INIT)
 psi_ref_deg_var   = tk.DoubleVar(value=PSI_REF_DEG_INIT)
-delay_ms_var      = tk.DoubleVar(value=60.0)   # estimate round-trip delay (ms)
-slew_deg_s_var    = tk.DoubleVar(value=30.0)   # setpoint slew rate (deg/s)
-smooth_alpha_var  = tk.DoubleVar(value=0.25)   # sensor smoothing alpha (0..1)
-enable_pred_var   = tk.BooleanVar(value=True)  # enable predict-ahead
-enable_aw_var     = tk.BooleanVar(value=True)  # enable anti-windup
+delay_ms_var      = tk.DoubleVar(value=80.0)   # >>> NEW default a bit higher
+slew_deg_s_var    = tk.DoubleVar(value=25.0)   # >>> NEW slightly slower slew
+smooth_alpha_var  = tk.DoubleVar(value=0.25)
+enable_pred_var   = tk.BooleanVar(value=True)
+enable_aw_var     = tk.BooleanVar(value=True)
+enable_ff_var     = tk.BooleanVar(value=True)  # >>> NEW toggle feed-forward
 
-# Display strings with 2-decimal formatting for setpoint labels
+# Display strings with 2-dec formatting
 theta_ref_str = tk.StringVar(value=f"{THETA_REF_DEG_INIT:.2f}")
 psi_ref_str   = tk.StringVar(value=f"{PSI_REF_DEG_INIT:.2f}")
 
 def update_refs_from_gui(*_):
-    """Update reference commands from GUI (deg->rad) and refresh 2-decimal labels."""
     global theta_ref_cmd, psi_ref_cmd
     th_deg = theta_ref_deg_var.get()
     ps_deg = psi_ref_deg_var.get()
@@ -217,14 +242,14 @@ def reset_integrator():
     z_int = np.zeros(2)
     log_message("[INFO] Integral states reset.")
 
-# Row: Pitch setpoint (with 2-dec label)
+# Row: Pitch setpoint
 row1 = tk.Frame(sp_frame, bg="#101820"); row1.pack(fill="x", padx=8, pady=3)
 tk.Label(row1, text="Pitch θᵣ (deg):", bg="#101820", fg="white", width=16, anchor="w").pack(side="left")
 theta_scale = ttk.Scale(row1, from_=-60.0, to=60.0, variable=theta_ref_deg_var, command=lambda v: update_refs_from_gui())
 theta_scale.pack(side="left", fill="x", expand=True, padx=8)
 tk.Label(row1, textvariable=theta_ref_str, bg="#101820", fg="white", width=8, anchor="e").pack(side="left")
 
-# Row: Yaw setpoint (with 2-dec label)
+# Row: Yaw setpoint
 row2 = tk.Frame(sp_frame, bg="#101820"); row2.pack(fill="x", padx=8, pady=3)
 tk.Label(row2, text="Yaw ψᵣ (deg):", bg="#101820", fg="white", width=16, anchor="w").pack(side="left")
 psi_scale = ttk.Scale(row2, from_=-90.0, to=90.0, variable=psi_ref_deg_var, command=lambda v: update_refs_from_gui())
@@ -234,16 +259,17 @@ tk.Label(row2, textvariable=psi_ref_str, bg="#101820", fg="white", width=8, anch
 # Row: Delay & smoothing
 row3 = tk.Frame(sp_frame, bg="#101820"); row3.pack(fill="x", padx=8, pady=3)
 tk.Label(row3, text="Delay (ms):", bg="#101820", fg="white", width=16, anchor="w").pack(side="left")
-delay_entry = ttk.Entry(row3, textvariable=delay_ms_var, width=8); delay_entry.pack(side="left", padx=(4,16))
+ttk.Entry(row3, textvariable=delay_ms_var, width=8).pack(side="left", padx=(4,16))
 tk.Label(row3, text="Smooth α (0–1):", bg="#101820", fg="white", width=16, anchor="w").pack(side="left")
-smooth_entry = ttk.Entry(row3, textvariable=smooth_alpha_var, width=8); smooth_entry.pack(side="left", padx=4)
+ttk.Entry(row3, textvariable=smooth_alpha_var, width=8).pack(side="left", padx=4)
 
 # Row: Slew & toggles
 row4 = tk.Frame(sp_frame, bg="#101820"); row4.pack(fill="x", padx=8, pady=3)
 tk.Label(row4, text="Slew (deg/s):", bg="#101820", fg="white", width=16, anchor="w").pack(side="left")
-slew_entry = ttk.Entry(row4, textvariable=slew_deg_s_var, width=8); slew_entry.pack(side="left", padx=(4,16))
+ttk.Entry(row4, textvariable=slew_deg_s_var, width=8).pack(side="left", padx=(4,16))
 ttk.Checkbutton(row4, text="Predict-ahead", variable=enable_pred_var).pack(side="left", padx=4)
 ttk.Checkbutton(row4, text="Anti-windup", variable=enable_aw_var).pack(side="left", padx=8)
+ttk.Checkbutton(row4, text="Feed-forward", variable=enable_ff_var).pack(side="left", padx=8)  # >>> NEW
 
 # Row: Buttons
 btn_row = tk.Frame(sp_frame, bg="#101820"); btn_row.pack(fill="x", padx=8, pady=(6, 8))
@@ -252,7 +278,7 @@ ttk.Button(btn_row, text="Reset Integrator", command=reset_integrator).pack(side
 # initialize refs once
 update_refs_from_gui()
 
-# ---- Logs (BOTTOM-LEFT)
+# ---- Logs (bottom-left)
 log_frame = tk.Frame(left_col, bg="#101820")
 log_frame.pack(fill="both", expand=True, padx=6)
 
@@ -295,7 +321,6 @@ for ax in (ax_tx, ax_rx):
     ax.xaxis.label.set_color("white")
     ax.yaxis.label.set_color("white")
 
-# 2-decimal tick formatters
 fmt2 = FuncFormatter(lambda y, _: f"{y:.2f}")
 ax_tx.yaxis.set_major_formatter(fmt2)
 ax_rx.yaxis.set_major_formatter(fmt2)
@@ -411,7 +436,7 @@ def receive_and_control():
             psi_dot_est = psi_dot_in
         _last_theta, _last_psi = theta_filt, psi_filt
 
-        # Slew-rate limit references (deg/s -> rad/s)
+        # Slew-rate limited references (deg/s -> rad/s)
         slew_rad_s = np.deg2rad(max(0.0, float(slew_deg_s_var.get())))
         theta_d = ramp_to(theta_d, theta_ref_cmd, slew_rad_s, dt_meas)
         psi_d   = ramp_to(psi_d,   psi_ref_cmd,   slew_rad_s, dt_meas)
@@ -424,23 +449,33 @@ def receive_and_control():
         tau = max(0.0, float(delay_ms_var.get()) / 1000.0) if enable_pred_var.get() else 0.0
         x_for_ctrl = predict_ahead(x_now, u_last, tau)
 
-        # Control law with integral action
-        err_angles = np.array([x_for_ctrl[0] - x_ref[0], x_for_ctrl[2] - x_ref[2]])
-        u_unsat = - K @ (x_for_ctrl - x_ref) - Ki * z_int
-        u_sat = np.clip(u_unsat, -U_MAX, U_MAX)
+        # ---- Feed-forward at desired equilibrium  # >>> NEW
+        if enable_ff_var.get():
+            u_ff, x_des = equilibrium_uff(theta_d, psi_d)
+        else:
+            u_ff = np.zeros(2)
+            x_des = x_ref  # for clarity
 
-        # Anti-windup
+        # Control law with integral action around x_ref / x_des
+        err_angles = np.array([x_for_ctrl[0] - x_ref[0], x_for_ctrl[2] - x_ref[2]])
+
+        # Unsaturated control: feed-forward + feedback + integral
+        u_unsat = u_ff - K @ (x_for_ctrl - x_ref) - Ki * z_int
+
+        # Saturate and anti-windup
+        u_sat = np.clip(u_unsat, -U_MAX, U_MAX)
         if enable_aw_var.get():
             z_int = anti_windup_update(z_int, err_angles, u_unsat, u_sat, dt_meas, k_aw=1.0)
         else:
+            # Conditional integration: integrate only if not pushing deeper into sat
             for i in range(2):
-                pushing_deeper = (abs(u_unsat[i]) > U_MAX) and (np.sign(u_unsat[i]) == np.sign(err_angles[i]*Ki[i]))
-                if not pushing_deeper:
+                pushing = (abs(u_unsat[i]) > U_MAX) and (np.sign(u_unsat[i]) == np.sign(err_angles[i] * Ki[i]))
+                if not pushing:
                     z_int[i] += err_angles[i] * dt_meas
 
-        u = u_sat
-        u0, u1 = float(u[0]), float(u[1])
-        u_last = u.copy()
+        # Output slew limit (du/dt) then final clip  # >>> NEW
+        u_cmd = apply_output_slew(u_sat, dt_meas)
+        u0, u1 = float(u_cmd[0]), float(u_cmd[1])
 
         # Publish control (u0,u1)
         out_msg = f"{u0:.4f},{u1:.4f}"
